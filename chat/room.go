@@ -34,12 +34,16 @@ type Room struct {
 	tracksMu         sync.RWMutex
 	audioQueue       [][]byte
 	audioQueueMu     sync.Mutex
+
+	sequenceNumber uint16
+	timestamp      uint32
+	ssrc           uint32
 }
 
 // NewRoom creates a new Room
 func NewRoom(id string) *Room {
 	// Create a log file for the room
-	logFile, err := os.OpenFile(fmt.Sprintf("%s.log", id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	logFile, err := os.OpenFile(fmt.Sprintf("%s.log", id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		log.Printf("Failed to create log file for room %s: %v", id, err)
 	}
@@ -77,6 +81,8 @@ func (room *Room) ConnectToOpenAI() error {
 	// Start the OpenAI writer
 	go room.writeLoop()
 
+	go room.streamAudioQueue()
+
 	return nil
 }
 
@@ -111,6 +117,10 @@ func (room *Room) handleOpenAIMessages() {
 					Voice:             "alloy",
 					InputAudioFormat:  "g711_ulaw",
 					OutputAudioFormat: "g711_ulaw",
+					TurnDetection: &openai.TurnDetectionConfig{
+						Type: "server_vad",
+					},
+
 					// The OpenAI API doesn't allow this even if the docs says it's fine.
 					// InputAudioTranscription: &openai.InputAudioTranscriptionConfig{
 					// 	Enabled: true,
@@ -118,18 +128,19 @@ func (room *Room) handleOpenAIMessages() {
 					// },
 				},
 			}
-			room.openAIWriteCh <- sessionUpdateEvent
 
-			// Update the room's session
-			room.mu.Lock()
-			room.session = &e.Session
-			room.mu.Unlock()
-
-			// Broadcast the session update to all users
-			msg := &SessionUpdateMessage{
-				Session: &e.Session,
+			if e.Session.InputAudioFormat != "g711_ulaw" {
+				room.openAIWriteCh <- sessionUpdateEvent
+				// Update the room's session
+				room.mu.Lock()
+				room.session = &e.Session
+				room.mu.Unlock()
+				// Broadcast the session update to all users
+				msg := &SessionUpdateMessage{
+					Session: &e.Session,
+				}
+				room.Broadcast(msg)
 			}
-			room.Broadcast(msg)
 
 		case *openai.ConversationItemCreatedEvent:
 			log.Printf("Conversation item created: ItemID: %s, Type: %s, Role: %s", e.Item.ID, e.Item.Type, e.Item.Role)
@@ -232,6 +243,7 @@ func (room *Room) handleOpenAIMessages() {
 
 		case *openai.InputAudioBufferSpeechStartedEvent:
 			log.Printf("Speech started: ItemID: %s, AudioStartMs: %d", e.ItemID, e.AudioStartMs)
+			room.clearAudioChunk()
 
 		case *openai.InputAudioBufferSpeechStoppedEvent:
 			log.Printf("Speech stopped: ItemID: %s, AudioEndMs: %d", e.ItemID, e.AudioEndMs)
@@ -583,6 +595,24 @@ func (room *Room) addAudioChunk(data []byte) {
 	room.audioQueue = append(room.audioQueue, data)
 }
 
+func (room *Room) clearAudioChunk() {
+	room.audioQueueMu.Lock()
+	defer room.audioQueueMu.Unlock()
+	room.audioQueue = room.audioQueue[:0]
+}
+
+func (room *Room) getAudioChunk() []byte {
+	room.audioQueueMu.Lock()
+	defer room.audioQueueMu.Unlock()
+	if len(room.audioQueue) == 0 {
+		return nil
+	}
+
+	audio := room.audioQueue[0]
+	room.audioQueue = room.audioQueue[1:]
+	return audio
+}
+
 // TODO: Implement a method to process the audio queue
 // This method should run in a separate goroutine
 // It should:
@@ -597,44 +627,78 @@ func (room *Room) setupUserWebRTC(user *User) error {
 		return fmt.Errorf("user PeerConnection is nil")
 	}
 
-	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypePCMU,
-			ClockRate: 8000,
-			Channels:  1,
-		},
-		"audio",
-		"pion",
-	)
-	if err != nil {
-		return fmt.Errorf("error creating audio track: %w", err)
-	}
-
 	room.tracksMu.Lock()
-	room.audioTracks[user] = audioTrack
+	room.audioTracks[user] = user.OutputTrack
 	room.tracksMu.Unlock()
-
-	// Add the new user's track to all existing users
-	room.mu.RLock()
-	for existingUser := range room.users {
-		if existingUser != user && existingUser.PeerConnection != nil {
-			if _, err := existingUser.PeerConnection.AddTrack(audioTrack); err != nil {
-				log.Printf("Error adding track to existing user %p: %v", existingUser, err)
-			}
-		}
-	}
-	room.mu.RUnlock()
-
-	// Add all existing users' tracks to the new user
-	room.tracksMu.RLock()
-	for existingUser, existingTrack := range room.audioTracks {
-		if existingUser != user {
-			if _, err := user.PeerConnection.AddTrack(existingTrack); err != nil {
-				log.Printf("Error adding existing track to new user %p: %v", user, err)
-			}
-		}
-	}
-	room.tracksMu.RUnlock()
-
 	return nil
+}
+
+func (room *Room) streamAudioQueue() {
+	chunkSize := 160 // 20ms of audio at 8kHz
+	packet := &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    0, // PCMU
+			SequenceNumber: room.getNextSequenceNumber(),
+			Timestamp:      room.getNextTimestamp(),
+			SSRC:           room.ssrc,
+		},
+		Payload: make([]byte, chunkSize),
+	}
+	for {
+		expire := time.Now().Add(20 * time.Millisecond)
+		audioData := room.getAudioChunk()
+		if len(audioData) == 0 {
+			packet.Header.Timestamp = room.getNextTimestamp()
+			packet.Header.SequenceNumber = room.getNextSequenceNumber()
+			for j := 0; j < chunkSize; j++ {
+				packet.Payload[j] = 0xFF
+			}
+			room.broadcastAudio(nil, packet)
+			if time.Now().Before(expire) {
+				time.Sleep(time.Until(expire))
+			}
+			continue
+		} else {
+			for i := 0; i < len(audioData); i += chunkSize {
+				end := i + chunkSize
+				if end > len(audioData) {
+					end = len(audioData)
+					copy(packet.Payload, audioData[i:end])
+					for j := 1; j <= chunkSize+i-end; j++ {
+						packet.Payload[chunkSize-j] = 0xFF
+					}
+				} else {
+					copy(packet.Payload, audioData[i:end])
+				}
+				packet.Header.Timestamp = room.getNextTimestamp()
+				packet.Header.SequenceNumber = room.getNextSequenceNumber()
+				room.broadcastAudio(nil, packet)
+				if time.Now().Before(expire) {
+					time.Sleep(time.Until(expire))
+				}
+				expire = time.Now().Add(20 * time.Millisecond)
+			}
+		}
+	}
+}
+
+// getNextSequenceNumber returns the next sequence number for RTP packets
+func (room *Room) getNextSequenceNumber() uint16 {
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	room.sequenceNumber++
+	return room.sequenceNumber
+}
+
+// getNextTimestamp returns the next timestamp for RTP packets
+func (room *Room) getNextTimestamp() uint32 {
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	room.timestamp += 160 // 20ms of audio at 8kHz
+	return room.timestamp
+}
+
+func (room *Room) SetSsrc(ssrc uint32) {
+	room.ssrc = ssrc
 }

@@ -19,7 +19,7 @@ func ConnectToOpenAI() (*websocket.Conn, error) {
 	}
 
 	openAIConn, resp, err := websocket.DefaultDialer.Dial(
-		"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+		"wss://kapi.stepfun.com/v1/realtime?model=step-1o-voice",
 		http.Header{
 			"Authorization": []string{"Bearer " + apiKey},
 			"OpenAI-Beta":   []string{"realtime=v1"},

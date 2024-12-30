@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/blixt/openai-realtime/openai"
 	"github.com/pion/interceptor"
@@ -59,21 +60,12 @@ func (user *User) SetupWebRTC(sdp string) error {
 		return err
 	}
 
-	rtpSender, err := peerConnection.AddTrack(outputTrack)
+	_, err = peerConnection.AddTrack(outputTrack)
 	if err != nil {
 		log.Println("Error adding track:", err)
 		return err
 	}
 	user.OutputTrack = outputTrack
-
-	go func() {
-		rtcpBuf := make([]byte, 1500)
-		for {
-			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
-				return
-			}
-		}
-	}()
 
 	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate != nil {
@@ -113,8 +105,13 @@ func (user *User) SetupWebRTC(sdp string) error {
 		return err
 	}
 
-	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+	// After setting up the PeerConnection and tracks
+	// Set up the audio tracks for this user in the room
+	if err = user.Room.setupUserWebRTC(user); err != nil {
+		return fmt.Errorf("error setting up user WebRTC: %w", err)
+	}
 
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
 	err = peerConnection.SetLocalDescription(answer)
 	if err != nil {
 		log.Println("SetLocalDescription error:", err)
@@ -122,18 +119,11 @@ func (user *User) SetupWebRTC(sdp string) error {
 	}
 
 	<-gatherComplete
-
+	time.Sleep(time.Second * 2)
 	msg := &WebRTCAnswerMessage{
 		SDP: peerConnection.LocalDescription().SDP,
 	}
 	user.WriteChan <- msg
-
-	// After setting up the PeerConnection and tracks
-	// Set up the audio tracks for this user in the room
-	if err = user.Room.setupUserWebRTC(user); err != nil {
-		return fmt.Errorf("error setting up user WebRTC: %w", err)
-	}
-
 	return nil
 }
 
@@ -148,9 +138,9 @@ func (user *User) handleIncomingAudio(track *webrtc.TrackRemote) {
 		}
 
 		// Write the RTP packet to the output track
-		if err = user.OutputTrack.WriteRTP(rtp); err != nil {
-			log.Println("Error writing RTP packet:", err)
-		}
+		// if err = user.OutputTrack.WriteRTP(rtp); err != nil {
+		// 	log.Println("Error writing RTP packet:", err)
+		// }
 
 		// Encode the audio data to base64
 		encodedAudio := base64.StdEncoding.EncodeToString(rtp.Payload)
